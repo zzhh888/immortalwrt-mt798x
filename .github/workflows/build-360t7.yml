@@ -17,23 +17,34 @@ jobs:
 
     env:
       TZ: Asia/Shanghai
+      SOURCE_REV: ba554197ed7e252fd3c1ee023621e1d1d009d323
 
     steps:
-      - name: Checkout verified source revision
+      # 先正常检出分支，避免短 SHA 直接检出导致 git exit code 1。
+      # fetch-depth: 0 会取得完整历史，后续可稳定切换到指定源码提交。
+      - name: Checkout workflow branch
         uses: actions/checkout@v4
         with:
-          # 与你可正常使用的 13791 固件一致的主源码提交
-          ref: ba55419
-          fetch-depth: 1
+          ref: openwrt-21.02
+          fetch-depth: 0
 
-      - name: Verify source revision
+      # 切换到与你可用 108M 固件一致的完整源码提交。
+      - name: Pin verified source revision
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse --short=7 HEAD)" = "ba55419"
-          echo "Verified source commit: $(git rev-parse --short=7 HEAD)"
+
+          git cat-file -e "${SOURCE_REV}^{commit}"
+          git checkout --detach "${SOURCE_REV}"
+
+          test "$(git rev-parse HEAD)" = "${SOURCE_REV}"
+
+          echo "========== Verified source =========="
+          git log -1 --oneline
+          git rev-parse HEAD
 
       - name: Free disk space
+        shell: bash
         run: |
           sudo rm -rf /usr/local/lib/android || true
           sudo rm -rf /usr/share/dotnet || true
@@ -42,67 +53,117 @@ jobs:
           df -h
 
       - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
-            gettext git libncurses5-dev libssl-dev libelf-dev \
-            python3 python3-distutils rsync unzip zlib1g-dev file wget \
-            device-tree-compiler qemu-utils
-
-      - name: Pin feeds to verified working revisions
         shell: bash
         run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            flex \
+            bison \
+            g++ \
+            gawk \
+            gcc-multilib \
+            g++-multilib \
+            gettext \
+            git \
+            libncurses5-dev \
+            libssl-dev \
+            libelf-dev \
+            python3 \
+            python3-distutils \
+            rsync \
+            unzip \
+            zlib1g-dev \
+            file \
+            wget \
+            ccache \
+            device-tree-compiler \
+            qemu-utils
+
+      # 固定为你上传的可用 108M 固件中记录的 feeds 版本。
+      - name: Pin verified feed revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+
           cat > feeds.conf.default <<'EOF'
-          src-git-full packages https://github.com/immortalwrt/packages.git^e09f3c7d1
-          src-git-full luci https://github.com/immortalwrt/luci.git^5829eabba5
-          src-git-full routing https://github.com/openwrt/routing.git^a9e4310
-          src-git-full telephony https://github.com/openwrt/telephony.git^920fbc5
+          src-git-full packages https://github.com/immortalwrt/packages.git^e09f3c7d1903cfe7f523e209ab3ec778013ba309
+          src-git-full luci https://github.com/immortalwrt/luci.git^5829eabba50ec0afa17d2ee486bc90dc15180c34
+          src-git-full routing https://github.com/openwrt/routing.git^a9e43101bb726070cbf81b6225fc0625f4a4a5e5
+          src-git-full telephony https://github.com/openwrt/telephony.git^f5120a46371ff75f401c1cb724c3880811bfbae0
           EOF
 
           echo "========== Pinned feeds =========="
           cat feeds.conf.default
 
-      - name: Restore source-download cache
-        uses: actions/cache@v4
-        with:
-          path: dl
-          key: mt7981-ba55419-e09f3c7d1-5829eabba5-a9e4310-920fbc5
-          restore-keys: |
-            mt7981-ba55419-
-
       - name: Update and install feeds
+        shell: bash
         run: |
+          set -euo pipefail
+
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+
+          test "$(git -C feeds/packages rev-parse HEAD)" = \
+            "e09f3c7d1903cfe7f523e209ab3ec778013ba309"
+
+          test "$(git -C feeds/luci rev-parse HEAD)" = \
+            "5829eabba50ec0afa17d2ee486bc90dc15180c34"
+
+          test "$(git -C feeds/routing rev-parse HEAD)" = \
+            "a9e43101bb726070cbf81b6225fc0625f4a4a5e5"
+
+          test "$(git -C feeds/telephony rev-parse HEAD)" = \
+            "f5120a46371ff75f401c1cb724c3880811bfbae0"
+
+          echo "========== Verified feed revisions =========="
+          git -C feeds/packages rev-parse --short=12 HEAD
+          git -C feeds/luci rev-parse --short=12 HEAD
+          git -C feeds/routing rev-parse --short=12 HEAD
+          git -C feeds/telephony rev-parse --short=12 HEAD
 
       - name: Prepare 360 T7 108M configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          # 保留仓库原始 MT7981 基础配置。
+          # 使用仓库原始 MT7981 基础配置。
           cp -f defconfig/mt7981-ax3000.config .config
 
-          # 删除基础配置中默认勾选的全部 MT7981 设备。
-          sed -i '/^CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_/d' .config
-          sed -i '/^CONFIG_TARGET_DEVICE_PACKAGES_mediatek_mt7981_DEVICE_/d' .config
+          # 删除基础配置中预选的所有 MT7981 路由器 Profile。
+          sed -i \
+            -e '/^CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_/d' \
+            -e '/^CONFIG_TARGET_DEVICE_PACKAGES_mediatek_mt7981_DEVICE_/d' \
+            .config
 
-          # 只选择与你当前路由器匹配的 360T7 108M UBI Profile。
-          echo 'CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_mt7981-360-t7-108M=y' >> .config
+          # 与可用 108M 固件一致：关闭多设备 Profile 和每设备独立 RootFS。
+          sed -i \
+            -e '/^CONFIG_TARGET_MULTI_PROFILE=/d' \
+            -e '/^# CONFIG_TARGET_MULTI_PROFILE is not set$/d' \
+            -e '/^CONFIG_TARGET_PER_DEVICE_ROOTFS=/d' \
+            -e '/^# CONFIG_TARGET_PER_DEVICE_ROOTFS is not set$/d' \
+            .config
 
-          # 自动补全依赖与缺省配置。
+          cat >> .config <<'EOF'
+          # CONFIG_TARGET_MULTI_PROFILE is not set
+          # CONFIG_TARGET_PER_DEVICE_ROOTFS is not set
+          CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_mt7981-360-t7-108M=y
+          EOF
+
+          # 补齐依赖、删除无效选项。
           make defconfig
 
-          # 强制检查：必须且只能存在一个 MT7981 设备 Profile。
+          # 必须只选中一个设备，且只能是 360T7 108M。
           target_count="$(grep -c '^CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_.*=y$' .config || true)"
 
-          test "$target_count" -eq 1
+          test "${target_count}" -eq 1
+
           grep -qx \
             'CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_mt7981-360-t7-108M=y' \
             .config
 
-          # 防止普通 36M Profile 被意外选中。
           if grep -qx \
             'CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_mt7981-360-t7=y' \
             .config; then
@@ -110,55 +171,82 @@ jobs:
             exit 1
           fi
 
+          if grep -qx 'CONFIG_TARGET_MULTI_PROFILE=y' .config || \
+             grep -qx 'CONFIG_TARGET_PER_DEVICE_ROOTFS=y' .config; then
+            echo "ERROR: Multi-profile or per-device RootFS was unexpectedly enabled."
+            exit 1
+          fi
+
           echo "========== Selected device =========="
           grep '^CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_.*=y$' .config
 
           echo "========== Selected device count =========="
-          echo "$target_count"
+          echo "${target_count}"
 
       - name: Download source packages
+        shell: bash
         run: |
+          set -euo pipefail
           make download -j8
 
       - name: Build firmware
+        shell: bash
         run: |
+          set -euo pipefail
           make -j"$(nproc)" V=s
 
-      - name: Prepare artifact
+      - name: Prepare firmware artifact
         shell: bash
         run: |
           set -euo pipefail
 
+          output_dir="bin/targets/mediatek/mt7981"
           mkdir -p artifact
 
-          sysupgrade="$(find bin/targets/mediatek/mt7981 \
+          sysupgrade="$(find "${output_dir}" \
             -maxdepth 1 \
             -type f \
             -name '*360-t7-108M*sysupgrade.bin' \
             -print -quit)"
 
-          test -n "$sysupgrade"
-          test -s "$sysupgrade"
-          cp -v "$sysupgrade" artifact/
-
-          factory="$(find bin/targets/mediatek/mt7981 \
+          factory="$(find "${output_dir}" \
             -maxdepth 1 \
             -type f \
             -name '*360-t7-108M*factory.bin' \
             -print -quit)"
 
-          if [ -n "$factory" ]; then
-            cp -v "$factory" artifact/
-          fi
+          test -n "${sysupgrade}"
+          test -s "${sysupgrade}"
 
+          test -n "${factory}"
+          test -s "${factory}"
+
+          control_path="$(tar -tf "${sysupgrade}" | sed -n '/\/CONTROL$/ {p; q;}')"
+
+          test "${control_path}" = \
+            "sysupgrade-mt7981-360-t7-108M/CONTROL"
+
+          tar -xOf "${sysupgrade}" "${control_path}" | \
+            grep -qx 'BOARD=mt7981-360-t7-108M'
+
+          cp -v "${sysupgrade}" artifact/
+          cp -v "${factory}" artifact/
           cp -v .config artifact/build.config
+          cp -v feeds.conf.default artifact/feeds.conf.default
+
+          printf '%s\n' "${SOURCE_REV}" > artifact/source-revision.txt
 
           (
             cd artifact
-            sha256sum *.bin build.config > sha256sums
+            sha256sum \
+              *.bin \
+              build.config \
+              feeds.conf.default \
+              source-revision.txt \
+              > sha256sums
           )
 
-          echo "========== Firmware files =========="
+          echo "========== Firmware artifact =========="
           ls -lh artifact/
 
       - name: Upload firmware artifact
