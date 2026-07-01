@@ -1,0 +1,140 @@
+name: Build ImmortalWrt for 360 T7
+
+on:
+  workflow_dispatch:
+    inputs:
+      layout:
+        description: "选择固件分区布局；普通 360T7 首次请选择 36M"
+        required: true
+        type: choice
+        default: "36M"
+        options:
+          - "36M"
+          - "108M"
+
+      extra_packages:
+        description: "额外软件包，空格分隔；首次建议保持默认"
+        required: false
+        default: "luci-app-ttyd"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-360t7-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    env:
+      TZ: Asia/Shanghai
+      EXTRA_PACKAGES: ${{ inputs.extra_packages }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: openwrt-21.02
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses5-dev libssl-dev libelf-dev \
+            python3 python3-distutils rsync unzip zlib1g-dev file wget \
+            ccache device-tree-compiler qemu-utils
+
+      - name: Restore download cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            dl
+            ~/.ccache
+          key: ${{ runner.os }}-mt7981-21.02-${{ hashFiles('feeds.conf.default', 'defconfig/mt7981-ax3000.config') }}
+          restore-keys: |
+            ${{ runner.os }}-mt7981-21.02-
+
+      - name: Update and install feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Prepare 360 T7 configuration
+        run: |
+          cp -f defconfig/mt7981-ax3000.config .config
+
+          # 删除基础配置中预选的全部 MT7981 设备，避免编译一堆无关机型
+          sed -i '/^CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_/d' .config
+          sed -i '/^CONFIG_TARGET_DEVICE_PACKAGES_mediatek_mt7981_DEVICE_/d' .config
+
+          # 按网页输入选择 360T7 分区布局
+          if [ "${{ inputs.layout }}" = "108M" ]; then
+            echo 'CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_mt7981-360-t7-108M=y' >> .config
+          else
+            echo 'CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_mt7981-360-t7=y' >> .config
+          fi
+
+          # 追加网页填写的软件包
+          for pkg in $EXTRA_PACKAGES; do
+            [ -z "$pkg" ] && continue
+            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+          done
+
+          make defconfig
+
+          echo "========== Selected device =========="
+          grep '^CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_.*=y' .config
+
+          echo "========== Extra packages =========="
+          for pkg in $EXTRA_PACKAGES; do
+            [ -z "$pkg" ] && continue
+            grep "^CONFIG_PACKAGE_${pkg}=y" .config || true
+          done
+
+      - name: Download source packages
+        run: |
+          make download -j8
+
+      - name: Build firmware
+        run: |
+          make -j"$(nproc)" V=s
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p artifact
+
+          find bin/targets/mediatek/mt7981 \
+            -maxdepth 1 \
+            -type f \
+            \( \
+              -name '*360-t7*factory.bin' -o \
+              -name '*360-t7*sysupgrade.bin' -o \
+              -name 'sha256sums' \
+            \) \
+            -exec cp -v {} artifact/ \;
+
+          cp -v .config artifact/build.config
+
+          echo "========== Firmware files =========="
+          ls -lh artifact/
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-360t7-${{ inputs.layout }}-${{ github.run_number }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
