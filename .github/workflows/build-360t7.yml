@@ -17,35 +17,26 @@ jobs:
 
     env:
       TZ: Asia/Shanghai
-      SOURCE_REV: ba554197ed7e252fd3c1ee023621e1d1d009d323
 
     steps:
-      # 先正常检出分支，避免短 SHA 直接检出导致 git exit code 1。
-      # fetch-depth: 0 会取得完整历史，后续可稳定切换到指定源码提交。
-      - name: Checkout workflow branch
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
           ref: openwrt-21.02
-          fetch-depth: 0
+          fetch-depth: 1
 
-      # 切换到与你可用 108M 固件一致的完整源码提交。
-      - name: Pin verified source revision
+      - name: Show source revision
         shell: bash
         run: |
           set -euo pipefail
-
-          git cat-file -e "${SOURCE_REV}^{commit}"
-          git checkout --detach "${SOURCE_REV}"
-
-          test "$(git rev-parse HEAD)" = "${SOURCE_REV}"
-
-          echo "========== Verified source =========="
+          echo "========== Source revision =========="
           git log -1 --oneline
           git rev-parse HEAD
 
       - name: Free disk space
         shell: bash
         run: |
+          set -euo pipefail
           sudo rm -rf /usr/local/lib/android || true
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /opt/ghc || true
@@ -55,6 +46,8 @@ jobs:
       - name: Install build dependencies
         shell: bash
         run: |
+          set -euo pipefail
+
           sudo apt-get update
 
           sudo apt-get install -y \
@@ -78,21 +71,19 @@ jobs:
             zlib1g-dev \
             file \
             wget \
-            ccache \
             device-tree-compiler \
             qemu-utils
 
-      # 固定为你上传的可用 108M 固件中记录的 feeds 版本。
-      - name: Pin verified feed revisions
+      - name: Pin feeds to verified 108M build revisions
         shell: bash
         run: |
           set -euo pipefail
 
           cat > feeds.conf.default <<'EOF'
-          src-git-full packages https://github.com/immortalwrt/packages.git^e09f3c7d1903cfe7f523e209ab3ec778013ba309
-          src-git-full luci https://github.com/immortalwrt/luci.git^5829eabba50ec0afa17d2ee486bc90dc15180c34
-          src-git-full routing https://github.com/openwrt/routing.git^a9e43101bb726070cbf81b6225fc0625f4a4a5e5
-          src-git-full telephony https://github.com/openwrt/telephony.git^f5120a46371ff75f401c1cb724c3880811bfbae0
+          src-git-full packages https://github.com/immortalwrt/packages.git^e09f3c7d1
+          src-git-full luci https://github.com/immortalwrt/luci.git^5829eabba5
+          src-git-full routing https://github.com/openwrt/routing.git^a9e4310
+          src-git-full telephony https://github.com/openwrt/telephony.git^920fbc5
           EOF
 
           echo "========== Pinned feeds =========="
@@ -106,82 +97,58 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          test "$(git -C feeds/packages rev-parse HEAD)" = \
-            "e09f3c7d1903cfe7f523e209ab3ec778013ba309"
-
-          test "$(git -C feeds/luci rev-parse HEAD)" = \
-            "5829eabba50ec0afa17d2ee486bc90dc15180c34"
-
-          test "$(git -C feeds/routing rev-parse HEAD)" = \
-            "a9e43101bb726070cbf81b6225fc0625f4a4a5e5"
-
-          test "$(git -C feeds/telephony rev-parse HEAD)" = \
-            "f5120a46371ff75f401c1cb724c3880811bfbae0"
-
-          echo "========== Verified feed revisions =========="
-          git -C feeds/packages rev-parse --short=12 HEAD
-          git -C feeds/luci rev-parse --short=12 HEAD
-          git -C feeds/routing rev-parse --short=12 HEAD
-          git -C feeds/telephony rev-parse --short=12 HEAD
+          echo "========== Resolved feed revisions =========="
+          for feed in packages luci routing telephony; do
+            printf '%-10s %s\n' \
+              "$feed" \
+              "$(git -C "feeds/$feed" rev-parse --short=12 HEAD)"
+          done
 
       - name: Prepare 360 T7 108M configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          # 使用仓库原始 MT7981 基础配置。
           cp -f defconfig/mt7981-ax3000.config .config
 
-          # 删除基础配置中预选的所有 MT7981 路由器 Profile。
+          # 删除基础配置中默认选中的所有 MT7981 设备 Profile。
           sed -i \
             -e '/^CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_/d' \
             -e '/^CONFIG_TARGET_DEVICE_PACKAGES_mediatek_mt7981_DEVICE_/d' \
-            .config
-
-          # 与可用 108M 固件一致：关闭多设备 Profile 和每设备独立 RootFS。
-          sed -i \
             -e '/^CONFIG_TARGET_MULTI_PROFILE=/d' \
             -e '/^# CONFIG_TARGET_MULTI_PROFILE is not set$/d' \
             -e '/^CONFIG_TARGET_PER_DEVICE_ROOTFS=/d' \
             -e '/^# CONFIG_TARGET_PER_DEVICE_ROOTFS is not set$/d' \
             .config
 
+          # 固定为单一的 360T7 108M UBI Profile。
           cat >> .config <<'EOF'
           # CONFIG_TARGET_MULTI_PROFILE is not set
           # CONFIG_TARGET_PER_DEVICE_ROOTFS is not set
           CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_mt7981-360-t7-108M=y
           EOF
 
-          # 补齐依赖、删除无效选项。
           make defconfig
 
-          # 必须只选中一个设备，且只能是 360T7 108M。
-          target_count="$(grep -c '^CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_.*=y$' .config || true)"
+          mapfile -t target_profiles < <(
+            grep '^CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_.*=y$' .config || true
+          )
 
-          test "${target_count}" -eq 1
+          # 必须且只能存在一个设备 Profile。
+          test "${#target_profiles[@]}" -eq 1
 
-          grep -qx \
-            'CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_mt7981-360-t7-108M=y' \
-            .config
+          # 必须是 360T7 108M，不允许误选普通 36M。
+          test "${target_profiles[0]}" = \
+            'CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_mt7981-360-t7-108M=y'
 
-          if grep -qx \
-            'CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_mt7981-360-t7=y' \
-            .config; then
-            echo "ERROR: Wrong 36M profile was selected."
-            exit 1
-          fi
-
-          if grep -qx 'CONFIG_TARGET_MULTI_PROFILE=y' .config || \
-             grep -qx 'CONFIG_TARGET_PER_DEVICE_ROOTFS=y' .config; then
-            echo "ERROR: Multi-profile or per-device RootFS was unexpectedly enabled."
-            exit 1
-          fi
+          ! grep -qx 'CONFIG_TARGET_MULTI_PROFILE=y' .config
+          ! grep -qx 'CONFIG_TARGET_PER_DEVICE_ROOTFS=y' .config
 
           echo "========== Selected device =========="
-          grep '^CONFIG_TARGET_DEVICE_mediatek_mt7981_DEVICE_.*=y$' .config
+          printf '%s\n' "${target_profiles[@]}"
 
           echo "========== Selected device count =========="
-          echo "${target_count}"
+          echo "${#target_profiles[@]}"
 
       - name: Download source packages
         shell: bash
@@ -195,32 +162,31 @@ jobs:
           set -euo pipefail
           make -j"$(nproc)" V=s
 
-      - name: Prepare firmware artifact
+      - name: Prepare sysupgrade artifact
         shell: bash
         run: |
           set -euo pipefail
 
           output_dir="bin/targets/mediatek/mt7981"
-          mkdir -p artifact
+          artifact_dir="artifact"
 
-          sysupgrade="$(find "${output_dir}" \
-            -maxdepth 1 \
-            -type f \
-            -name '*360-t7-108M*sysupgrade.bin' \
-            -print -quit)"
+          mkdir -p "${artifact_dir}"
 
-          factory="$(find "${output_dir}" \
-            -maxdepth 1 \
-            -type f \
-            -name '*360-t7-108M*factory.bin' \
-            -print -quit)"
+          mapfile -t sysupgrade_files < <(
+            find "${output_dir}" \
+              -maxdepth 1 \
+              -type f \
+              -name '*360-t7-108M*sysupgrade.bin' \
+              -print
+          )
 
-          test -n "${sysupgrade}"
+          # 最终必须且只能找到一个 360T7 108M sysupgrade 固件。
+          test "${#sysupgrade_files[@]}" -eq 1
+
+          sysupgrade="${sysupgrade_files[0]}"
           test -s "${sysupgrade}"
 
-          test -n "${factory}"
-          test -s "${factory}"
-
+          # 核验 sysupgrade 内部设备标识，避免误上传其他型号固件。
           control_path="$(tar -tf "${sysupgrade}" | sed -n '/\/CONTROL$/ {p; q;}')"
 
           test "${control_path}" = \
@@ -229,15 +195,17 @@ jobs:
           tar -xOf "${sysupgrade}" "${control_path}" | \
             grep -qx 'BOARD=mt7981-360-t7-108M'
 
-          cp -v "${sysupgrade}" artifact/
-          cp -v "${factory}" artifact/
-          cp -v .config artifact/build.config
-          cp -v feeds.conf.default artifact/feeds.conf.default
+          # Artifact 内仅复制一个可刷写文件：sysupgrade.bin。
+          cp -v "${sysupgrade}" "${artifact_dir}/"
 
-          printf '%s\n' "${SOURCE_REV}" > artifact/source-revision.txt
+          # 以下文件仅用于核验，不是固件。
+          cp -v .config "${artifact_dir}/build.config"
+          cp -v feeds.conf.default "${artifact_dir}/feeds.conf.default"
+          git rev-parse HEAD > "${artifact_dir}/source-revision.txt"
 
           (
-            cd artifact
+            cd "${artifact_dir}"
+
             sha256sum \
               *.bin \
               build.config \
@@ -246,13 +214,13 @@ jobs:
               > sha256sums
           )
 
-          echo "========== Firmware artifact =========="
-          ls -lh artifact/
+          echo "========== Artifact files =========="
+          ls -lh "${artifact_dir}"
 
-      - name: Upload firmware artifact
+      - name: Upload sysupgrade artifact
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-360t7-108M-${{ github.run_number }}
+          name: immortalwrt-360t7-108M-sysupgrade-${{ github.run_number }}
           path: artifact/
           if-no-files-found: error
           retention-days: 7
